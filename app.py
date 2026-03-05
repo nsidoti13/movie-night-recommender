@@ -64,31 +64,21 @@ def render_card(row, row_idx: int):
     st.write(overview_short)
 
 
-def liked_sidebar(user: str, liked: list, df: pd.DataFrame):
-    with st.sidebar:
-        st.markdown(f"**{user}'s Likes ({len(liked)})**")
-        for idx in liked[-15:]:
-            st.write(f"👍 {df.iloc[idx]['title']}")
-
-
 # ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
 
 def _load_into_session(user: str):
-    """Read this user's saved ratings from disk into session state."""
     saved = storage.load_user(user)
     u = user.lower()
-    st.session_state[f"{u}_liked"]   = saved["liked"]
+    st.session_state[f"{u}_liked"]    = saved["liked"]
     st.session_state[f"{u}_disliked"] = saved["disliked"]
-    st.session_state[f"{u}_unseen"]  = saved["unseen"]
-    st.session_state[f"{u}_done"]    = saved["done"]
-    card = saved["current_card"]
-    st.session_state[f"current_card_{u}"] = card
+    st.session_state[f"{u}_unseen"]   = saved["unseen"]
+    st.session_state[f"{u}_done"]     = saved["done"]
+    st.session_state[f"current_card_{u}"] = saved["current_card"]
 
 
 def _save_from_session(user: str):
-    """Write this user's session state ratings back to disk."""
     u = user.lower()
     storage.save_user(user, {
         "liked":        st.session_state[f"{u}_liked"],
@@ -101,10 +91,30 @@ def _save_from_session(user: str):
 
 def _advance_card(user: str):
     u = user.lower()
-    liked    = st.session_state[f"{u}_liked"]
+    liked   = st.session_state[f"{u}_liked"]
     disliked = st.session_state[f"{u}_disliked"]
-    unseen   = st.session_state[f"{u}_unseen"]
+    unseen  = st.session_state[f"{u}_unseen"]
     st.session_state[f"current_card_{u}"] = next_card(liked, disliked + unseen)
+
+
+def _rerate(user: str, idx: int, new_status: str):
+    """Move a movie index from whatever list it's in to new_status (liked/disliked/unseen/none)."""
+    u = user.lower()
+    for lst in ("liked", "disliked", "unseen"):
+        key = f"{u}_{lst}"
+        if idx in st.session_state[key]:
+            st.session_state[key].remove(idx)
+    if new_status in ("liked", "disliked", "unseen"):
+        st.session_state[f"{u}_{new_status}"].append(idx)
+    _save_from_session(user)
+
+
+def _current_status(user: str, idx: int) -> str | None:
+    u = user.lower()
+    for lst in ("liked", "disliked", "unseen"):
+        if idx in st.session_state[f"{u}_{lst}"]:
+            return lst
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +122,16 @@ def _advance_card(user: str):
 # ---------------------------------------------------------------------------
 
 def init_state():
-    load_data()  # warm cache
+    load_data()
     if "phase" not in st.session_state:
         st.session_state.phase = "login"
     if "active_user" not in st.session_state:
         st.session_state.active_user = None
 
-    # Load both users' saved ratings on first run of each session
     if "session_loaded" not in st.session_state:
         for user in ("Regan", "Nicholas"):
             _load_into_session(user)
-            # If they had a saved card, keep it; otherwise we'll assign when they log in
         st.session_state.session_loaded = True
-
-        # If both users are done, jump straight to results
         if st.session_state.regan_done and st.session_state.nicholas_done:
             st.session_state.phase = "results"
 
@@ -138,6 +144,88 @@ def reset_all():
 
 
 # ---------------------------------------------------------------------------
+# Sidebar: search + review
+# ---------------------------------------------------------------------------
+
+def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
+    u = user.lower()
+    liked    = st.session_state[f"{u}_liked"]
+    disliked = st.session_state[f"{u}_disliked"]
+    unseen   = st.session_state[f"{u}_unseen"]
+
+    with st.sidebar:
+        # ── Search & Add ──────────────────────────────────────────────────
+        st.markdown("### 🔍 Search & Add")
+        query = st.text_input("Type a movie title", key="search_query", placeholder="e.g. Inception")
+
+        if query.strip():
+            q = query.strip().lower()
+            matches = [(title, idx) for title, idx in movie_index.items() if q in title]
+            matches.sort(key=lambda x: (not x[0].startswith(q), x[0]))  # exact-start first
+            matches = matches[:10]
+
+            if matches:
+                options = {f"{df.iloc[idx]['title']} ({int(df.iloc[idx].get('year', 0) or 0)})": idx
+                           for _, idx in matches}
+                chosen_label = st.selectbox("Results", list(options.keys()), key="search_select")
+                chosen_idx = options[chosen_label]
+
+                # Show current status if already rated
+                status = _current_status(user, chosen_idx)
+                status_labels = {"liked": "👍 Liked", "disliked": "👎 Disliked", "unseen": "🤷 Haven't Seen"}
+                if status:
+                    st.caption(f"Currently: {status_labels[status]}")
+
+                sa, sb, sc = st.columns(3)
+                if sa.button("👍", key="search_like", use_container_width=True, help="Like"):
+                    _rerate(user, chosen_idx, "liked")
+                    st.rerun()
+                if sb.button("👎", key="search_dislike", use_container_width=True, help="Dislike"):
+                    _rerate(user, chosen_idx, "disliked")
+                    st.rerun()
+                if sc.button("🤷", key="search_unseen", use_container_width=True, help="Haven't Seen"):
+                    _rerate(user, chosen_idx, "unseen")
+                    st.rerun()
+            else:
+                st.caption("No matches found.")
+
+        st.markdown("---")
+
+        # ── Review Ratings ────────────────────────────────────────────────
+        st.markdown("### 📋 My Ratings")
+
+        for lst_key, label, icon in [("liked", "Liked", "👍"), ("disliked", "Disliked", "👎"), ("unseen", "Haven't Seen", "🤷")]:
+            indices = st.session_state[f"{u}_{lst_key}"]
+            with st.expander(f"{icon} {label} ({len(indices)})", expanded=(lst_key == "liked")):
+                if not indices:
+                    st.caption("None yet.")
+                else:
+                    for idx in reversed(indices):  # most recent first
+                        row = df.iloc[idx]
+                        title = row["title"]
+                        year = int(row.get("year", 0) or 0)
+                        st.markdown(f"**{title}** ({year})")
+                        ca, cb, cc, cd = st.columns(4)
+                        if ca.button("👍", key=f"re_{lst_key}_{idx}_like", help="Like"):
+                            _rerate(user, idx, "liked")
+                            st.rerun()
+                        if cb.button("👎", key=f"re_{lst_key}_{idx}_dislike", help="Dislike"):
+                            _rerate(user, idx, "disliked")
+                            st.rerun()
+                        if cc.button("🤷", key=f"re_{lst_key}_{idx}_unseen", help="Haven't Seen"):
+                            _rerate(user, idx, "unseen")
+                            st.rerun()
+                        if cd.button("✕", key=f"re_{lst_key}_{idx}_remove", help="Remove"):
+                            _rerate(user, idx, "none")
+                            st.rerun()
+
+        st.markdown("---")
+        if st.button("← Back", use_container_width=True):
+            st.session_state.phase = "login"
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Phase: Login
 # ---------------------------------------------------------------------------
 
@@ -146,7 +234,6 @@ def login_phase():
     st.markdown("### Who are you?")
     st.markdown(" ")
 
-    # Show status of each user
     ratings = storage.load()
     for user in ("Regan", "Nicholas"):
         u = user.lower()
@@ -182,7 +269,7 @@ def login_phase():
 # ---------------------------------------------------------------------------
 
 def rating_phase():
-    df, _, _ = load_data()
+    df, _, movie_index = load_data()
     user = st.session_state.active_user
     other = "Nicholas" if user == "Regan" else "Regan"
     u = user.lower()
@@ -226,10 +313,9 @@ def rating_phase():
 
     if like_count >= MIN_LIKES:
         st.markdown(" ")
-        if st.button(f"✅ I'm Done Rating", use_container_width=True):
+        if st.button("✅ I'm Done Rating", use_container_width=True):
             st.session_state[f"{u}_done"] = True
             _save_from_session(user)
-            # Check if the other user is also done (read from disk, not just session)
             other_data = storage.load_user(other)
             if other_data["done"]:
                 st.session_state.phase = "results"
@@ -237,13 +323,8 @@ def rating_phase():
                 st.session_state.phase = "login"
             st.rerun()
 
-    liked_sidebar(user, liked, df)
-
-    with st.sidebar:
-        st.markdown("---")
-        if st.button("← Back"):
-            st.session_state.phase = "login"
-            st.rerun()
+    # Sidebar with search + review
+    rating_sidebar(user, df, movie_index)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +342,6 @@ def results_phase():
     )
     st.caption("← Regan " + "─" * 18 + " Nicholas →")
 
-    # Always read from disk so both devices see the same results
     ratings = storage.load()
     recs = joint_recommendations(
         ratings["regan"]["liked"],
