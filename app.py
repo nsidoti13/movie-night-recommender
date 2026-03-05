@@ -11,6 +11,7 @@ import pandas as pd
 
 import storage
 from recommender import load_data, next_card, joint_recommendations, reset_seeds
+from llm_search import smart_search, _api_available
 
 # ---------------------------------------------------------------------------
 # Config
@@ -147,6 +148,36 @@ def reset_all():
 # Sidebar: search + review
 # ---------------------------------------------------------------------------
 
+def _render_search_results(indices: list[int], user: str, df: pd.DataFrame, key_prefix: str):
+    """Render a selectbox + rate buttons for a list of movie row indices."""
+    if not indices:
+        st.caption("No matches found.")
+        return
+
+    status_labels = {"liked": "👍 Liked", "disliked": "👎 Disliked", "unseen": "🤷 Haven't Seen"}
+    options = {
+        f"{df.iloc[idx]['title']} ({int(df.iloc[idx].get('year', 0) or 0)})": idx
+        for idx in indices
+    }
+    chosen_label = st.selectbox("Results", list(options.keys()), key=f"{key_prefix}_select")
+    chosen_idx = options[chosen_label]
+
+    status = _current_status(user, chosen_idx)
+    if status:
+        st.caption(f"Currently: {status_labels[status]}")
+
+    sa, sb, sc = st.columns(3)
+    if sa.button("👍", key=f"{key_prefix}_like", use_container_width=True, help="Like"):
+        _rerate(user, chosen_idx, "liked")
+        st.rerun()
+    if sb.button("👎", key=f"{key_prefix}_dislike", use_container_width=True, help="Dislike"):
+        _rerate(user, chosen_idx, "disliked")
+        st.rerun()
+    if sc.button("🤷", key=f"{key_prefix}_unseen", use_container_width=True, help="Haven't Seen"):
+        _rerate(user, chosen_idx, "unseen")
+        st.rerun()
+
+
 def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
     u = user.lower()
     liked    = st.session_state[f"{u}_liked"]
@@ -156,38 +187,50 @@ def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
     with st.sidebar:
         # ── Search & Add ──────────────────────────────────────────────────
         st.markdown("### 🔍 Search & Add")
-        query = st.text_input("Type a movie title", key="search_query", placeholder="e.g. Inception")
+
+        query = st.text_input(
+            "Search movies",
+            key="search_query",
+            placeholder="e.g. Inception, marvel movies, Nolan films…"
+        )
 
         if query.strip():
             q = query.strip().lower()
-            matches = [(title, idx) for title, idx in movie_index.items() if q in title]
-            matches.sort(key=lambda x: (not x[0].startswith(q), x[0]))  # exact-start first
-            matches = matches[:10]
 
-            if matches:
-                options = {f"{df.iloc[idx]['title']} ({int(df.iloc[idx].get('year', 0) or 0)})": idx
-                           for _, idx in matches}
-                chosen_label = st.selectbox("Results", list(options.keys()), key="search_select")
-                chosen_idx = options[chosen_label]
+            # ── Basic contains search (instant) ───────────────────────────
+            basic = [idx for title, idx in movie_index.items() if q in title]
+            basic.sort(key=lambda idx: (
+                not df.iloc[idx]['title'].lower().startswith(q),
+                -float(df.iloc[idx].get('popularity', 0) or 0)
+            ))
+            basic = basic[:10]
 
-                # Show current status if already rated
-                status = _current_status(user, chosen_idx)
-                status_labels = {"liked": "👍 Liked", "disliked": "👎 Disliked", "unseen": "🤷 Haven't Seen"}
-                if status:
-                    st.caption(f"Currently: {status_labels[status]}")
+            # ── AI Smart Search ───────────────────────────────────────────
+            # Triggered by button; result stored in session state so it
+            # persists across reruns without re-calling the API.
+            ai_key = f"ai_results_{q}"
+            ai_results = st.session_state.get(ai_key, None)
 
-                sa, sb, sc = st.columns(3)
-                if sa.button("👍", key="search_like", use_container_width=True, help="Like"):
-                    _rerate(user, chosen_idx, "liked")
+            if _api_available():
+                if st.button("✨ AI Search", use_container_width=True, key="ai_search_btn",
+                             help="Uses Claude to match descriptions, franchises, typos, and more"):
+                    with st.spinner("Thinking…"):
+                        st.session_state[ai_key] = smart_search(query, movie_index, df)
+                    ai_results = st.session_state[ai_key]
                     st.rerun()
-                if sb.button("👎", key="search_dislike", use_container_width=True, help="Dislike"):
-                    _rerate(user, chosen_idx, "disliked")
+
+            # Show AI results if available, otherwise basic results
+            if ai_results is not None:
+                st.caption(f"✨ AI results for "{query}"")
+                _render_search_results(ai_results, user, df, key_prefix="ai")
+                if st.button("Clear AI results", key="clear_ai"):
+                    del st.session_state[ai_key]
                     st.rerun()
-                if sc.button("🤷", key="search_unseen", use_container_width=True, help="Haven't Seen"):
-                    _rerate(user, chosen_idx, "unseen")
-                    st.rerun()
+            elif basic:
+                st.caption("Basic results (use ✨ AI Search for descriptions/franchises/typos)")
+                _render_search_results(basic, user, df, key_prefix="basic")
             else:
-                st.caption("No matches found.")
+                st.caption("No basic matches. Try ✨ AI Search.")
 
         st.markdown("---")
 
