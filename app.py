@@ -221,7 +221,7 @@ def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
 
             # Show AI results if available, otherwise basic results
             if ai_results is not None:
-                st.caption(f"✨ AI results for "{query}"")
+                st.caption(f'✨ AI results for "{query}"')
                 _render_search_results(ai_results, user, df, key_prefix="ai")
                 if st.button("Clear AI results", key="clear_ai"):
                     del st.session_state[ai_key]
