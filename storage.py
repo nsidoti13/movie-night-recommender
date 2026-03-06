@@ -37,16 +37,17 @@ _DEFAULTS = {
 
 
 def _use_postgres() -> bool:
-    return _HAS_PSYCOPG2 and bool(DATABASE_URL)
+    return _HAS_PSYCOPG2 and bool(DATABASE_URL) and _pg_available is not False
 
 
 @contextmanager
 def _db():
     """Open a connection, yield it, then always close it."""
     url = DATABASE_URL
-    # Supabase requires SSL — add it if not already specified
-    if "supabase" in url and "sslmode" not in url:
-        url += "?sslmode=require"
+    # Supabase requires SSL — add sslmode if not already present
+    if "sslmode" not in url:
+        sep = "&" if "?" in url else "?"
+        url += f"{sep}sslmode=require"
     conn = psycopg2.connect(url, connect_timeout=10)
     try:
         yield conn
@@ -61,6 +62,7 @@ def _db():
 # ── Schema migration (runs once per process) ──────────────────────────────
 
 _migrated = False
+_pg_available: bool | None = None  # None = untested, True = working, False = failed
 
 
 def _pg_migrate():
@@ -98,10 +100,16 @@ def _pg_migrate():
 
 
 def _ensure_migrated():
-    global _migrated
-    if not _migrated and _use_postgres():
+    global _migrated, _pg_available
+    if _migrated or not (_HAS_PSYCOPG2 and bool(DATABASE_URL)):
+        return
+    try:
         _pg_migrate()
+        _pg_available = True
         _migrated = True
+    except Exception as exc:
+        _pg_available = False
+        print(f"[storage] PostgreSQL unavailable ({exc}); falling back to JSON file.")
 
 
 # ── PostgreSQL read / write ────────────────────────────────────────────────
@@ -231,36 +239,48 @@ def _file_clear():
 def load() -> dict:
     _ensure_migrated()
     if _use_postgres():
-        return {
-            "regan":    _pg_load_user("regan"),
-            "nicholas": _pg_load_user("nicholas"),
-        }
+        try:
+            return {
+                "regan":    _pg_load_user("regan"),
+                "nicholas": _pg_load_user("nicholas"),
+            }
+        except Exception as exc:
+            print(f"[storage] load() DB error ({exc}); using file fallback.")
     return _file_load()
 
 
 def load_user(user: str) -> dict:
     _ensure_migrated()
     if _use_postgres():
-        return _pg_load_user(user)
+        try:
+            return _pg_load_user(user)
+        except Exception as exc:
+            print(f"[storage] load_user() DB error ({exc}); using file fallback.")
     return _file_load()[user.lower()]
 
 
 def save_user(user: str, user_data: dict):
     _ensure_migrated()
     if _use_postgres():
-        _pg_save_user(user, user_data)
-    else:
-        data = _file_load()
-        data[user.lower()] = user_data
-        _file_save(data)
+        try:
+            _pg_save_user(user, user_data)
+            return
+        except Exception as exc:
+            print(f"[storage] save_user() DB error ({exc}); using file fallback.")
+    data = _file_load()
+    data[user.lower()] = user_data
+    _file_save(data)
 
 
 def clear():
     _ensure_migrated()
     if _use_postgres():
-        _pg_clear()
-    else:
-        _file_clear()
+        try:
+            _pg_clear()
+            return
+        except Exception as exc:
+            print(f"[storage] clear() DB error ({exc}); using file fallback.")
+    _file_clear()
 
 
 def backend() -> str:
