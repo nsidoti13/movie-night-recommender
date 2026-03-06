@@ -44,6 +44,44 @@ def _get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
+def _pg_migrate():
+    """Create tables if they don't exist (runs once on startup)."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ratings (
+                    user_name   TEXT    NOT NULL,
+                    movie_idx   INTEGER NOT NULL,
+                    status      TEXT    NOT NULL CHECK (status IN ('liked', 'disliked', 'unseen')),
+                    rated_at    TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (user_name, movie_idx)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_state (
+                    user_name    TEXT    PRIMARY KEY,
+                    done         BOOLEAN DEFAULT FALSE,
+                    current_card INTEGER DEFAULT NULL,
+                    updated_at   TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE OR REPLACE VIEW rating_summary AS
+                SELECT
+                    user_name,
+                    COUNT(*) FILTER (WHERE status = 'liked')    AS liked,
+                    COUNT(*) FILTER (WHERE status = 'disliked') AS disliked,
+                    COUNT(*) FILTER (WHERE status = 'unseen')   AS unseen,
+                    COUNT(*)                                     AS total
+                FROM ratings
+                GROUP BY user_name
+            """)
+        conn.commit()
+
+
+_migrated = False
+
+
 # ── PostgreSQL implementation ──────────────────────────────────────────────
 
 def _pg_load_user(user: str) -> dict:
@@ -188,7 +226,18 @@ def _file_clear():
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+def _ensure_migrated():
+    global _migrated
+    if not _migrated and _use_postgres():
+        try:
+            _pg_migrate()
+            _migrated = True
+        except Exception:
+            pass
+
+
 def load() -> dict:
+    _ensure_migrated()
     if _use_postgres():
         try:
             return _pg_load()
@@ -209,6 +258,7 @@ def save(data: dict):
 
 
 def load_user(user: str) -> dict:
+    _ensure_migrated()
     if _use_postgres():
         try:
             return _pg_load_user(user)
