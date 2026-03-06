@@ -1,17 +1,30 @@
 """
-storage.py — Persist ratings across sessions.
+storage.py — Persist ratings to PostgreSQL (primary) or JSON file (fallback).
 
-Strategy (works both locally and on Streamlit Cloud):
-- Primary:   module-level dict shared across all browser sessions in the same
-             running process (survives page refreshes, handles multi-device).
-- Secondary: data/ratings.json on disk (survives app restarts locally;
-             on Streamlit Cloud the file may reset on redeploy, but the
-             in-memory store covers the active session).
+PostgreSQL is used when DATABASE_URL is set in the environment or .env file.
+Falls back to in-memory + JSON when no database is configured (e.g. Streamlit Cloud
+without a hosted DB).
 """
 
 import json
 import os
 
+# ── Optional dependencies ──────────────────────────────────────────────────
+try:
+    import psycopg2
+    import psycopg2.extras
+    _HAS_PSYCOPG2 = True
+except ImportError:
+    _HAS_PSYCOPG2 = False
+
+# Load .env file if present (local development)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 RATINGS_FILE = "data/ratings.json"
 
 _DEFAULTS = {
@@ -22,15 +35,111 @@ _DEFAULTS = {
     "current_card": None,
 }
 
-# In-memory store — shared across ALL sessions in the same running process.
+
+def _use_postgres() -> bool:
+    return _HAS_PSYCOPG2 and bool(DATABASE_URL)
+
+
+def _get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+# ── PostgreSQL implementation ──────────────────────────────────────────────
+
+def _pg_load_user(user: str) -> dict:
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Ratings
+            cur.execute(
+                "SELECT movie_idx, status FROM ratings WHERE user_name = %s",
+                (user.lower(),)
+            )
+            rows = cur.fetchall()
+            liked    = [r["movie_idx"] for r in rows if r["status"] == "liked"]
+            disliked = [r["movie_idx"] for r in rows if r["status"] == "disliked"]
+            unseen   = [r["movie_idx"] for r in rows if r["status"] == "unseen"]
+
+            # State
+            cur.execute(
+                "SELECT done, current_card FROM user_state WHERE user_name = %s",
+                (user.lower(),)
+            )
+            state = cur.fetchone()
+            done         = state["done"]         if state else False
+            current_card = state["current_card"] if state else None
+
+    return {
+        "liked": liked,
+        "disliked": disliked,
+        "unseen": unseen,
+        "done": done,
+        "current_card": current_card,
+    }
+
+
+def _pg_save_user(user: str, data: dict):
+    u = user.lower()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            # Upsert each rated movie
+            all_rated = (
+                [(u, idx, "liked")    for idx in data["liked"]]
+                + [(u, idx, "disliked") for idx in data["disliked"]]
+                + [(u, idx, "unseen")   for idx in data["unseen"]]
+            )
+
+            # Remove ratings no longer present
+            cur.execute("DELETE FROM ratings WHERE user_name = %s", (u,))
+
+            if all_rated:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO ratings (user_name, movie_idx, status)
+                    VALUES %s
+                    ON CONFLICT (user_name, movie_idx)
+                    DO UPDATE SET status = EXCLUDED.status, rated_at = NOW()
+                    """,
+                    all_rated,
+                )
+
+            # Upsert user state
+            cur.execute(
+                """
+                INSERT INTO user_state (user_name, done, current_card, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (user_name)
+                DO UPDATE SET done = EXCLUDED.done,
+                              current_card = EXCLUDED.current_card,
+                              updated_at = NOW()
+                """,
+                (u, data["done"], data["current_card"]),
+            )
+        conn.commit()
+
+
+def _pg_load() -> dict:
+    return {
+        "regan":   _pg_load_user("regan"),
+        "nicholas": _pg_load_user("nicholas"),
+    }
+
+
+def _pg_clear():
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ratings")
+            cur.execute("DELETE FROM user_state")
+        conn.commit()
+
+
+# ── JSON / in-memory fallback ──────────────────────────────────────────────
+
 _store: dict | None = None
 
 
 def _default_store() -> dict:
-    return {
-        "regan":   dict(_DEFAULTS),
-        "nicholas": dict(_DEFAULTS),
-    }
+    return {"regan": dict(_DEFAULTS), "nicholas": dict(_DEFAULTS)}
 
 
 def _ensure_keys(data: dict) -> dict:
@@ -41,12 +150,10 @@ def _ensure_keys(data: dict) -> dict:
     return data
 
 
-def load() -> dict:
-    """Return the full ratings dict (in-memory, falling back to disk)."""
+def _file_load() -> dict:
     global _store
     if _store is not None:
         return _store
-    # Try loading from disk
     if os.path.exists(RATINGS_FILE):
         try:
             with open(RATINGS_FILE) as f:
@@ -58,8 +165,7 @@ def load() -> dict:
     return _store
 
 
-def save(data: dict):
-    """Write to the in-memory store and attempt to persist to disk."""
+def _file_save(data: dict):
     global _store
     _store = data
     try:
@@ -67,21 +173,10 @@ def save(data: dict):
         with open(RATINGS_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception:
-        pass  # Disk write optional — in-memory store is authoritative
+        pass
 
 
-def load_user(user: str) -> dict:
-    return load()[user.lower()]
-
-
-def save_user(user: str, user_data: dict):
-    data = load()
-    data[user.lower()] = user_data
-    save(data)
-
-
-def clear():
-    """Reset everything."""
+def _file_clear():
     global _store
     _store = _default_store()
     try:
@@ -89,3 +184,61 @@ def clear():
             os.remove(RATINGS_FILE)
     except Exception:
         pass
+
+
+# ── Public API ─────────────────────────────────────────────────────────────
+
+def load() -> dict:
+    if _use_postgres():
+        try:
+            return _pg_load()
+        except Exception:
+            pass
+    return _file_load()
+
+
+def save(data: dict):
+    if _use_postgres():
+        try:
+            _pg_save_user("regan",   data["regan"])
+            _pg_save_user("nicholas", data["nicholas"])
+            return
+        except Exception:
+            pass
+    _file_save(data)
+
+
+def load_user(user: str) -> dict:
+    if _use_postgres():
+        try:
+            return _pg_load_user(user)
+        except Exception:
+            pass
+    return _file_load()[user.lower()]
+
+
+def save_user(user: str, user_data: dict):
+    if _use_postgres():
+        try:
+            _pg_save_user(user, user_data)
+            return
+        except Exception:
+            pass
+    data = _file_load()
+    data[user.lower()] = user_data
+    _file_save(data)
+
+
+def clear():
+    if _use_postgres():
+        try:
+            _pg_clear()
+            return
+        except Exception:
+            pass
+    _file_clear()
+
+
+def backend() -> str:
+    """Return a string describing the active storage backend."""
+    return "PostgreSQL" if _use_postgres() else "JSON file"

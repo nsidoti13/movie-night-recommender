@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:16
+    container_name: movie_night_db
+    environment:
+      POSTGRES_DB: movie_night
+      POSTGRES_USER: movie_user
+      POSTGRES_PASSWORD: movie_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U movie_user -d movie_night"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
