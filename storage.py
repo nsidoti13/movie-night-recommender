@@ -2,12 +2,12 @@
 storage.py — Persist ratings to PostgreSQL (primary) or JSON file (fallback).
 
 PostgreSQL is used when DATABASE_URL is set in the environment or .env file.
-Falls back to in-memory + JSON when no database is configured (e.g. Streamlit Cloud
-without a hosted DB).
+Falls back to JSON file (local) or empty state (cloud) when no DB is configured.
 """
 
 import json
 import os
+from contextlib import contextmanager
 
 # ── Optional dependencies ──────────────────────────────────────────────────
 try:
@@ -40,19 +40,38 @@ def _use_postgres() -> bool:
     return _HAS_PSYCOPG2 and bool(DATABASE_URL)
 
 
-def _get_conn():
-    return psycopg2.connect(DATABASE_URL)
+@contextmanager
+def _db():
+    """Open a connection, yield it, then always close it."""
+    url = DATABASE_URL
+    # Supabase requires SSL — add it if not already specified
+    if "supabase" in url and "sslmode" not in url:
+        url += "?sslmode=require"
+    conn = psycopg2.connect(url, connect_timeout=10)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ── Schema migration (runs once per process) ──────────────────────────────
+
+_migrated = False
 
 
 def _pg_migrate():
-    """Create tables if they don't exist (runs once on startup)."""
-    with _get_conn() as conn:
+    with _db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ratings (
                     user_name   TEXT    NOT NULL,
                     movie_idx   INTEGER NOT NULL,
-                    status      TEXT    NOT NULL CHECK (status IN ('liked', 'disliked', 'unseen')),
+                    status      TEXT    NOT NULL
+                                CHECK (status IN ('liked', 'disliked', 'unseen')),
                     rated_at    TIMESTAMPTZ DEFAULT NOW(),
                     PRIMARY KEY (user_name, movie_idx)
                 )
@@ -76,99 +95,79 @@ def _pg_migrate():
                 FROM ratings
                 GROUP BY user_name
             """)
-        conn.commit()
 
 
-_migrated = False
+def _ensure_migrated():
+    global _migrated
+    if not _migrated and _use_postgres():
+        _pg_migrate()
+        _migrated = True
 
 
-# ── PostgreSQL implementation ──────────────────────────────────────────────
+# ── PostgreSQL read / write ────────────────────────────────────────────────
 
 def _pg_load_user(user: str) -> dict:
-    with _get_conn() as conn:
+    u = user.lower()
+    with _db() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Ratings
             cur.execute(
-                "SELECT movie_idx, status FROM ratings WHERE user_name = %s",
-                (user.lower(),)
+                "SELECT movie_idx, status FROM ratings WHERE user_name = %s ORDER BY rated_at",
+                (u,)
             )
             rows = cur.fetchall()
             liked    = [r["movie_idx"] for r in rows if r["status"] == "liked"]
             disliked = [r["movie_idx"] for r in rows if r["status"] == "disliked"]
             unseen   = [r["movie_idx"] for r in rows if r["status"] == "unseen"]
 
-            # State
             cur.execute(
                 "SELECT done, current_card FROM user_state WHERE user_name = %s",
-                (user.lower(),)
+                (u,)
             )
             state = cur.fetchone()
-            done         = state["done"]         if state else False
-            current_card = state["current_card"] if state else None
 
     return {
-        "liked": liked,
-        "disliked": disliked,
-        "unseen": unseen,
-        "done": done,
-        "current_card": current_card,
+        "liked":        liked,
+        "disliked":     disliked,
+        "unseen":       unseen,
+        "done":         bool(state["done"])         if state else False,
+        "current_card": state["current_card"] if state else None,
     }
 
 
 def _pg_save_user(user: str, data: dict):
     u = user.lower()
-    with _get_conn() as conn:
+    all_rated = (
+        [(u, idx, "liked")    for idx in data["liked"]]
+        + [(u, idx, "disliked") for idx in data["disliked"]]
+        + [(u, idx, "unseen")   for idx in data["unseen"]]
+    )
+    with _db() as conn:
         with conn.cursor() as cur:
-            # Upsert each rated movie
-            all_rated = (
-                [(u, idx, "liked")    for idx in data["liked"]]
-                + [(u, idx, "disliked") for idx in data["disliked"]]
-                + [(u, idx, "unseen")   for idx in data["unseen"]]
-            )
-
-            # Remove ratings no longer present
             cur.execute("DELETE FROM ratings WHERE user_name = %s", (u,))
-
             if all_rated:
                 psycopg2.extras.execute_values(
                     cur,
-                    """
-                    INSERT INTO ratings (user_name, movie_idx, status)
-                    VALUES %s
-                    ON CONFLICT (user_name, movie_idx)
-                    DO UPDATE SET status = EXCLUDED.status, rated_at = NOW()
-                    """,
+                    "INSERT INTO ratings (user_name, movie_idx, status) VALUES %s",
                     all_rated,
                 )
-
-            # Upsert user state
             cur.execute(
                 """
                 INSERT INTO user_state (user_name, done, current_card, updated_at)
                 VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (user_name)
-                DO UPDATE SET done = EXCLUDED.done,
-                              current_card = EXCLUDED.current_card,
-                              updated_at = NOW()
+                ON CONFLICT (user_name) DO UPDATE
+                    SET done         = EXCLUDED.done,
+                        current_card = EXCLUDED.current_card,
+                        updated_at   = NOW()
                 """,
                 (u, data["done"], data["current_card"]),
             )
-        conn.commit()
-
-
-def _pg_load() -> dict:
-    return {
-        "regan":   _pg_load_user("regan"),
-        "nicholas": _pg_load_user("nicholas"),
-    }
 
 
 def _pg_clear():
-    with _get_conn() as conn:
+    with _db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM ratings")
             cur.execute("DELETE FROM user_state")
-        conn.commit()
 
 
 # ── JSON / in-memory fallback ──────────────────────────────────────────────
@@ -177,7 +176,10 @@ _store: dict | None = None
 
 
 def _default_store() -> dict:
-    return {"regan": dict(_DEFAULTS), "nicholas": dict(_DEFAULTS)}
+    return {
+        "regan":    {k: (list(v) if isinstance(v, list) else v) for k, v in _DEFAULTS.items()},
+        "nicholas": {k: (list(v) if isinstance(v, list) else v) for k, v in _DEFAULTS.items()},
+    }
 
 
 def _ensure_keys(data: dict) -> dict:
@@ -226,69 +228,40 @@ def _file_clear():
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def _ensure_migrated():
-    global _migrated
-    if not _migrated and _use_postgres():
-        try:
-            _pg_migrate()
-            _migrated = True
-        except Exception:
-            pass
-
-
 def load() -> dict:
     _ensure_migrated()
     if _use_postgres():
-        try:
-            return _pg_load()
-        except Exception:
-            pass
+        return {
+            "regan":    _pg_load_user("regan"),
+            "nicholas": _pg_load_user("nicholas"),
+        }
     return _file_load()
-
-
-def save(data: dict):
-    if _use_postgres():
-        try:
-            _pg_save_user("regan",   data["regan"])
-            _pg_save_user("nicholas", data["nicholas"])
-            return
-        except Exception:
-            pass
-    _file_save(data)
 
 
 def load_user(user: str) -> dict:
     _ensure_migrated()
     if _use_postgres():
-        try:
-            return _pg_load_user(user)
-        except Exception:
-            pass
+        return _pg_load_user(user)
     return _file_load()[user.lower()]
 
 
 def save_user(user: str, user_data: dict):
+    _ensure_migrated()
     if _use_postgres():
-        try:
-            _pg_save_user(user, user_data)
-            return
-        except Exception:
-            pass
-    data = _file_load()
-    data[user.lower()] = user_data
-    _file_save(data)
+        _pg_save_user(user, user_data)
+    else:
+        data = _file_load()
+        data[user.lower()] = user_data
+        _file_save(data)
 
 
 def clear():
+    _ensure_migrated()
     if _use_postgres():
-        try:
-            _pg_clear()
-            return
-        except Exception:
-            pass
-    _file_clear()
+        _pg_clear()
+    else:
+        _file_clear()
 
 
 def backend() -> str:
-    """Return a string describing the active storage backend."""
     return "PostgreSQL" if _use_postgres() else "JSON file"
