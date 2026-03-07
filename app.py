@@ -129,13 +129,6 @@ def init_state():
     if "active_user" not in st.session_state:
         st.session_state.active_user = None
 
-    if "session_loaded" not in st.session_state:
-        for user in ("Regan", "Nicholas"):
-            _load_into_session(user)
-        st.session_state.session_loaded = True
-        if st.session_state.regan_done and st.session_state.nicholas_done:
-            st.session_state.phase = "results"
-
 
 def reset_all():
     storage.clear()
@@ -272,39 +265,55 @@ def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
 # Phase: Login
 # ---------------------------------------------------------------------------
 
+def _enter_as(uname: str):
+    """Load user into session and go to rating phase."""
+    _load_into_session(uname)
+    if st.session_state.get(f"current_card_{uname}") is None:
+        _advance_card(uname)
+        _save_from_session(uname)
+    st.session_state.active_user = uname
+    st.session_state.phase = "rating"
+    st.rerun()
+
+
 def login_phase():
     st.title("🎬 Movie Night")
-    st.markdown("### Who are you?")
-    st.markdown(" ")
 
-    ratings = storage.load()
-    for user in ("Regan", "Nicholas"):
-        u = user.lower()
-        n_likes = len(ratings[u]["liked"])
-        done = ratings[u]["done"]
-        status = "✅ Done" if done else (f"{n_likes} likes so far" if n_likes else "Not started")
-        st.caption(f"{user}: {status}")
+    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
 
-    st.markdown(" ")
-    col1, col2 = st.columns(2)
+    with tab_login:
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", use_container_width=True, key="login_btn"):
+            u = username.strip().lower()
+            if not u or not password:
+                st.error("Please enter your username and password.")
+            elif storage.authenticate(u, password):
+                _enter_as(u)
+            else:
+                st.error("Invalid username or password.")
 
-    if col1.button("👩 I'm Regan", use_container_width=True):
-        _load_into_session("Regan")
-        if st.session_state.current_card_regan is None:
-            _advance_card("Regan")
-            _save_from_session("Regan")
-        st.session_state.active_user = "Regan"
-        st.session_state.phase = "rating"
-        st.rerun()
+    with tab_signup:
+        new_username = st.text_input("Choose a username", key="signup_username")
+        new_password = st.text_input("Choose a password", type="password", key="signup_password")
+        confirm_pw   = st.text_input("Confirm password",  type="password", key="signup_confirm")
+        if st.button("Create Account", use_container_width=True, key="signup_btn"):
+            u = new_username.strip().lower()
+            if not u or not new_password:
+                st.error("Please fill in all fields.")
+            elif new_password != confirm_pw:
+                st.error("Passwords don't match.")
+            elif not storage.create_user(u, new_password):
+                st.error("That username is already taken.")
+            else:
+                st.success(f"Account created! Switch to the Login tab to sign in.")
 
-    if col2.button("👨 I'm Nicholas", use_container_width=True):
-        _load_into_session("Nicholas")
-        if st.session_state.current_card_nicholas is None:
-            _advance_card("Nicholas")
-            _save_from_session("Nicholas")
-        st.session_state.active_user = "Nicholas"
-        st.session_state.phase = "rating"
-        st.rerun()
+    users_with_ratings = storage.list_users()
+    if len(users_with_ratings) >= 2:
+        st.markdown("---")
+        if st.button("🎉 See Results", use_container_width=True):
+            st.session_state.phase = "results"
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -314,14 +323,13 @@ def login_phase():
 def rating_phase():
     df, _, movie_index = load_data()
     user = st.session_state.active_user
-    other = "Nicholas" if user == "Regan" else "Regan"
     u = user.lower()
 
     liked    = st.session_state[f"{u}_liked"]
     disliked = st.session_state[f"{u}_disliked"]
     card_key = f"current_card_{u}"
 
-    st.title(f"🎬 {user}'s Turn")
+    st.title(f"🎬 {user.capitalize()}'s Turn")
     like_count = len(liked)
     st.progress(
         min(like_count / MIN_LIKES, 1.0),
@@ -359,11 +367,7 @@ def rating_phase():
         if st.button("✅ I'm Done Rating", use_container_width=True):
             st.session_state[f"{u}_done"] = True
             _save_from_session(user)
-            other_data = storage.load_user(other)
-            if other_data["done"]:
-                st.session_state.phase = "results"
-            else:
-                st.session_state.phase = "login"
+            st.session_state.phase = "login"
             st.rerun()
 
     # Sidebar with search + review
@@ -379,18 +383,40 @@ def results_phase():
 
     st.title("🎉 Movies You'll Both Love")
 
+    users = storage.list_users()
+    if len(users) < 2:
+        st.warning("Need at least 2 users who have rated movies.")
+        if st.button("← Back to Login"):
+            st.session_state.phase = "login"
+            st.rerun()
+        return
+
+    display_names = [u.capitalize() for u in users]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        p1_display = st.selectbox("Person 1", display_names, index=0, key="compare_user1")
+    with col2:
+        p2_display = st.selectbox("Person 2", display_names, index=1, key="compare_user2")
+
+    p1 = p1_display.lower()
+    p2 = p2_display.lower()
+
+    if p1 == p2:
+        st.warning("Please select two different people.")
+        return
+
     blend = st.slider(
         "Taste Blend", 0.0, 1.0, 0.5, 0.05,
-        help="0 = Regan's taste only · 1 = Nicholas's taste only"
+        help=f"0 = {p1_display}'s taste only · 1 = {p2_display}'s taste only"
     )
-    st.caption("← Regan " + "─" * 18 + " Nicholas →")
+    st.caption(f"← {p1_display} " + "─" * 18 + f" {p2_display} →")
 
-    ratings = storage.load()
+    r1 = storage.load_user(p1)
+    r2 = storage.load_user(p2)
     recs = joint_recommendations(
-        ratings["regan"]["liked"],
-        ratings["nicholas"]["liked"],
-        ratings["regan"]["disliked"],
-        ratings["nicholas"]["disliked"],
+        r1["liked"], r2["liked"],
+        r1["disliked"], r2["disliked"],
         blend=blend,
         n=10,
     )
@@ -406,7 +432,10 @@ def results_phase():
                 st.markdown("---")
 
     st.markdown(" ")
-    if st.button("🔄 Start Over"):
+    if st.button("← Back to Login", use_container_width=True):
+        st.session_state.phase = "login"
+        st.rerun()
+    if st.button("🔄 Reset All Data", use_container_width=True):
         reset_all()
         st.rerun()
 

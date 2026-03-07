@@ -1,5 +1,13 @@
 -- Movie Night Recommender — Database Schema
 
+-- User accounts
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    salt          TEXT NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Stores each movie rating per user
 CREATE TABLE IF NOT EXISTS ratings (
     user_name   TEXT    NOT NULL,

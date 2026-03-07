@@ -5,8 +5,10 @@ PostgreSQL is used when DATABASE_URL is set in the environment or .env file.
 Falls back to JSON file (local) or empty state (cloud) when no DB is configured.
 """
 
+import hashlib
 import json
 import os
+import secrets
 from contextlib import contextmanager
 
 # ── Optional dependencies ──────────────────────────────────────────────────
@@ -25,7 +27,8 @@ except ImportError:
     pass
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-RATINGS_FILE = "data/ratings.json"
+RATINGS_FILE  = "data/ratings.json"
+ACCOUNTS_FILE = "data/accounts.json"
 
 _DEFAULTS = {
     "liked": [],
@@ -68,6 +71,14 @@ _pg_available: bool | None = None  # None = untested, True = working, False = fa
 def _pg_migrate():
     with _db() as conn:
         with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username      TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    salt          TEXT NOT NULL,
+                    created_at    TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ratings (
                     user_name   TEXT    NOT NULL,
@@ -113,6 +124,72 @@ def _ensure_migrated():
 
 
 # ── PostgreSQL read / write ────────────────────────────────────────────────
+
+# ── Password helpers ───────────────────────────────────────────────────────
+
+def _new_salt() -> str:
+    return secrets.token_hex(16)
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+
+
+# ── Account storage (PostgreSQL) ───────────────────────────────────────────
+
+def _pg_create_user(username: str, password: str) -> bool:
+    """Returns False if username already taken."""
+    salt = _new_salt()
+    pw_hash = _hash_password(password, salt)
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO users (username, password_hash, salt) VALUES (%s, %s, %s)",
+                (username, pw_hash, salt),
+            )
+    return True
+
+
+def _pg_authenticate(username: str, password: str) -> bool:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT password_hash, salt FROM users WHERE username = %s", (username,)
+            )
+            row = cur.fetchone()
+    if not row:
+        return False
+    stored_hash, salt = row
+    return _hash_password(password, salt) == stored_hash
+
+
+# ── Account storage (JSON file) ────────────────────────────────────────────
+
+def _accounts_load() -> dict:
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _accounts_save(data: dict):
+    os.makedirs("data", exist_ok=True)
+    with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _pg_list_users() -> list[str]:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_name FROM user_state ORDER BY user_name")
+            return [r[0] for r in cur.fetchall()]
+
 
 def _pg_load_user(user: str) -> dict:
     u = user.lower()
@@ -183,18 +260,18 @@ def _pg_clear():
 _store: dict | None = None
 
 
+def _default_user() -> dict:
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in _DEFAULTS.items()}
+
+
 def _default_store() -> dict:
-    return {
-        "regan":    {k: (list(v) if isinstance(v, list) else v) for k, v in _DEFAULTS.items()},
-        "nicholas": {k: (list(v) if isinstance(v, list) else v) for k, v in _DEFAULTS.items()},
-    }
+    return {}
 
 
 def _ensure_keys(data: dict) -> dict:
-    for user in ("regan", "nicholas"):
-        data.setdefault(user, {})
+    for user in list(data.keys()):
         for k, v in _DEFAULTS.items():
-            data[user].setdefault(k, v)
+            data[user].setdefault(k, list(v) if isinstance(v, list) else v)
     return data
 
 
@@ -236,14 +313,57 @@ def _file_clear():
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+def create_user(username: str, password: str) -> bool:
+    """Register a new account. Returns False if username already taken."""
+    _ensure_migrated()
+    u = username.lower()
+    if _use_postgres():
+        try:
+            return _pg_create_user(u, password)
+        except Exception as exc:
+            print(f"[storage] create_user() DB error ({exc}); using file fallback.")
+    accounts = _accounts_load()
+    if u in accounts:
+        return False
+    salt = _new_salt()
+    accounts[u] = {"password_hash": _hash_password(password, salt), "salt": salt}
+    _accounts_save(accounts)
+    return True
+
+
+def authenticate(username: str, password: str) -> bool:
+    """Return True if the credentials are valid."""
+    _ensure_migrated()
+    u = username.lower()
+    if _use_postgres():
+        try:
+            return _pg_authenticate(u, password)
+        except Exception as exc:
+            print(f"[storage] authenticate() DB error ({exc}); using file fallback.")
+    accounts = _accounts_load()
+    if u not in accounts:
+        return False
+    entry = accounts[u]
+    return _hash_password(password, entry["salt"]) == entry["password_hash"]
+
+
+def list_users() -> list[str]:
+    """Return sorted list of all known user names (lowercase)."""
+    _ensure_migrated()
+    if _use_postgres():
+        try:
+            return _pg_list_users()
+        except Exception as exc:
+            print(f"[storage] list_users() DB error ({exc}); using file fallback.")
+    return sorted(_file_load().keys())
+
+
 def load() -> dict:
     _ensure_migrated()
     if _use_postgres():
         try:
-            return {
-                "regan":    _pg_load_user("regan"),
-                "nicholas": _pg_load_user("nicholas"),
-            }
+            users = _pg_list_users()
+            return {u: _pg_load_user(u) for u in users}
         except Exception as exc:
             print(f"[storage] load() DB error ({exc}); using file fallback.")
     return _file_load()
@@ -256,7 +376,8 @@ def load_user(user: str) -> dict:
             return _pg_load_user(user)
         except Exception as exc:
             print(f"[storage] load_user() DB error ({exc}); using file fallback.")
-    return _file_load()[user.lower()]
+    u = user.lower()
+    return _file_load().get(u, _default_user())
 
 
 def save_user(user: str, user_data: dict):
