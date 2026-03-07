@@ -102,12 +102,22 @@ def _taste_profile(liked: list[int], matrix) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _most_popular_recent(df: pd.DataFrame) -> int:
+    """Return the index of the highest-popularity movie from 2010 onwards."""
+    recent = df[df["year"] >= 2010]
+    if recent.empty:
+        recent = df
+    return int(recent["popularity"].fillna(0).idxmax())
+
+
 def next_card(liked: list[int], disliked: list[int]) -> int:
     """Return the row index of the best next movie to show."""
     df, matrix, _ = load_data()
     seen = set(liked) | set(disliked)
 
     if not liked:
+        if not seen:  # very first card — show the most popular recent movie
+            return _most_popular_recent(df)
         return _get_next_seed(df, seen)
 
     profile = _taste_profile(liked, matrix)
