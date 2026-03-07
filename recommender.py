@@ -1,46 +1,65 @@
 """
-recommender.py — Recommendation engine.
-Loads precomputed data once and exposes two functions:
-    next_card(liked, disliked, df, matrix) → row index
-    joint_recommendations(liked_a, liked_b, df, matrix, blend=0.5, n=10) → list of row indices
+recommender.py — Recommendation engine (K-means clustering).
+
+Movies are clustered into N_CLUSTERS groups at load time using their
+sentence-transformer embeddings. User taste is represented as a weight
+distribution over those clusters (fraction of liked movies per cluster).
+Recommendations score each unseen movie by its cluster's weight, breaking
+ties with cosine similarity to the cluster centroid.
+
+Public API:
+    next_card(liked, disliked)                         → row index
+    joint_recommendations(liked_a, liked_b, ...)       → list of row indices
+    reset_seeds()
 """
 
 import json
 import random
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 
-DATA_DIR = "data"
+DATA_DIR  = "data"
+N_CLUSTERS = 30
 
 # ---------------------------------------------------------------------------
-# Data loading (cached at module level so it only happens once per session)
+# Module-level cache
 # ---------------------------------------------------------------------------
 _df: pd.DataFrame | None = None
-_matrix = None
+_matrix: np.ndarray | None = None        # (N, 384) sentence embeddings
 _movie_index: dict | None = None
+_cluster_labels: np.ndarray | None = None  # (N,) int  — cluster id per movie
+_centroid_sims: np.ndarray | None = None   # (N,) float — cosine sim to own centroid
 
 
 def load_data():
-    global _df, _matrix, _movie_index
+    global _df, _matrix, _movie_index, _cluster_labels, _centroid_sims
     if _df is None:
         _df = pd.read_parquet(f"{DATA_DIR}/movies.parquet")
-        _matrix = np.load(f"{DATA_DIR}/embeddings.npy")  # shape (N, 384), float32
+        _matrix = np.load(f"{DATA_DIR}/embeddings.npy")
         with open(f"{DATA_DIR}/movie_index.json") as f:
             _movie_index = json.load(f)
+
+        km = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10, max_iter=300)
+        _cluster_labels = km.fit_predict(_matrix)
+
+        # Pre-compute each movie's cosine similarity to its own cluster centroid
+        all_sims = cosine_similarity(_matrix, km.cluster_centers_)  # (N, K)
+        _centroid_sims = all_sims[np.arange(len(_df)), _cluster_labels]  # (N,)
+
     return _df, _matrix, _movie_index
 
 
 # ---------------------------------------------------------------------------
-# Seed movies — one per major genre to bootstrap cold-start
+# Seed movies — cold-start rotation
 # ---------------------------------------------------------------------------
 SEED_GENRES = ["Action", "Comedy", "Drama", "Horror", "Romance",
                "Science Fiction", "Animation", "Thriller", "Adventure", "Fantasy"]
 
 
 def _genre_seeds(df: pd.DataFrame, seen: set) -> list[int]:
-    """Return one random movie index per major genre, excluding already-seen ones."""
-    import json, ast
+    import ast
 
     def has_genre(genres_val, genre_name):
         try:
@@ -73,7 +92,6 @@ def reset_seeds():
 
 def _get_next_seed(df: pd.DataFrame, seen: set) -> int:
     global _seed_queue, _seed_seen
-    # Replenish queue if empty or all used
     available = [s for s in _seed_queue if s not in seen]
     if not available:
         _seed_queue = _genre_seeds(df, seen)
@@ -82,48 +100,59 @@ def _get_next_seed(df: pd.DataFrame, seen: set) -> int:
         idx = available[0]
         _seed_queue.remove(idx)
         return idx
-    # Absolute fallback: random unseen movie
     all_idx = set(range(len(df))) - seen
     return random.choice(list(all_idx)) if all_idx else 0
 
 
-# ---------------------------------------------------------------------------
-# Taste profile
-# ---------------------------------------------------------------------------
-def _taste_profile(liked: list[int], matrix: np.ndarray) -> np.ndarray:
-    """Average embedding vector of liked movies, returned as shape (1, D)."""
-    if not liked:
-        return None
-    return matrix[liked].mean(axis=0, keepdims=True)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def _most_popular_recent(df: pd.DataFrame) -> int:
-    """Return the index of the highest-popularity movie from 2010 onwards."""
     recent = df[df["year"] >= 2010]
     if recent.empty:
         recent = df
     return int(recent["popularity"].fillna(0).idxmax())
 
 
+# ---------------------------------------------------------------------------
+# Cluster scoring
+# ---------------------------------------------------------------------------
+
+def _cluster_weights(liked: list[int]) -> np.ndarray:
+    """Weight for each cluster = fraction of liked movies that belong to it."""
+    weights = np.zeros(N_CLUSTERS)
+    for idx in liked:
+        weights[_cluster_labels[idx]] += 1
+    total = weights.sum()
+    return weights / total if total > 0 else weights
+
+
+def _score_movies(weights: np.ndarray, seen: set) -> np.ndarray:
+    """
+    Score every movie by its cluster weight.
+    Ties broken by cosine similarity to the cluster centroid (scaled small
+    so cluster weight always dominates).
+    """
+    scores = weights[_cluster_labels] + 0.01 * _centroid_sims
+    for idx in seen:
+        scores[idx] = -np.inf
+    return scores
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def next_card(liked: list[int], disliked: list[int]) -> int:
     """Return the row index of the best next movie to show."""
-    df, matrix, _ = load_data()
+    df, _, _ = load_data()
     seen = set(liked) | set(disliked)
 
     if not liked:
-        if not seen:  # very first card — show the most popular recent movie
+        if not seen:
             return _most_popular_recent(df)
         return _get_next_seed(df, seen)
 
-    profile = _taste_profile(liked, matrix)
-    sims = cosine_similarity(profile, matrix)[0]
-    # Zero out seen movies
-    for idx in seen:
-        sims[idx] = -1.0
-    return int(np.argmax(sims))
+    weights = _cluster_weights(liked)
+    scores  = _score_movies(weights, seen)
+    return int(np.argmax(scores))
 
 
 def joint_recommendations(
@@ -135,29 +164,22 @@ def joint_recommendations(
     n: int = 10,
 ) -> list[int]:
     """
-    Return top-n movie indices for a joint audience.
+    Return top-n movie indices for a joint audience using blended cluster weights.
     blend=0.5 weights both users equally; 0.0 = fully user A, 1.0 = fully user B.
     """
-    df, matrix, _ = load_data()
+    load_data()
     disliked_a = disliked_a or []
     disliked_b = disliked_b or []
     seen = set(liked_a) | set(liked_b) | set(disliked_a) | set(disliked_b)
 
-    profile_a = _taste_profile(liked_a, matrix)
-    profile_b = _taste_profile(liked_b, matrix)
-
-    if profile_a is None and profile_b is None:
+    if not liked_a and not liked_b:
         return []
-    if profile_a is None:
-        joint = profile_b
-    elif profile_b is None:
-        joint = profile_a
-    else:
-        joint = (1 - blend) * profile_a + blend * profile_b
 
-    sims = cosine_similarity(joint, matrix)[0]
-    for idx in seen:
-        sims[idx] = -1.0
+    weights_a = _cluster_weights(liked_a) if liked_a else np.ones(N_CLUSTERS) / N_CLUSTERS
+    weights_b = _cluster_weights(liked_b) if liked_b else np.ones(N_CLUSTERS) / N_CLUSTERS
 
-    top_indices = np.argsort(sims)[::-1]
-    return [int(i) for i in top_indices if sims[i] >= 0][:n]
+    blended = (1 - blend) * weights_a + blend * weights_b
+    scores  = _score_movies(blended, seen)
+
+    top = np.argsort(scores)[::-1]
+    return [int(i) for i in top if np.isfinite(scores[i])][:n]
