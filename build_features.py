@@ -13,9 +13,8 @@ import ast
 import os
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
 from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
 import kagglehub
 
 DATA_DIR = "data"
@@ -50,16 +49,31 @@ def extract_director(crew_value):
     return ""
 
 
-def build_soup(row):
-    """Combine genres, keywords, top cast, and director into a single string."""
+def build_embed_text(row):
+    """Build a rich natural-language description for embedding."""
+    parts = [str(row.get("title", "")).strip()]
+
+    overview = str(row.get("overview", "")).strip()
+    if overview and overview != "nan":
+        parts.append(overview)
+
     genres = extract_names(row.get("genres", "[]"))
-    keywords = extract_names(row.get("keywords", "[]"))
+    if genres:
+        parts.append("Genres: " + ", ".join(genres))
+
+    keywords = extract_names(row.get("keywords", "[]"), limit=10)
+    if keywords:
+        parts.append("Keywords: " + ", ".join(keywords))
+
     cast = extract_names(row.get("cast", "[]"), limit=3)
+    if cast:
+        parts.append("Starring: " + ", ".join(cast))
+
     director = extract_director(row.get("crew", "[]"))
-    parts = genres + keywords + cast
     if director:
-        parts.append(director)
-    return " ".join(parts).lower()
+        parts.append("Directed by: " + director)
+
+    return ". ".join(parts)
 
 
 def main():
@@ -83,17 +97,23 @@ def main():
     if "release_date" in df.columns:
         df["year"] = pd.to_datetime(df["release_date"], errors="coerce").dt.year.fillna(0).astype(int)
 
-    # Build soup for TF-IDF
-    print("Building text soup…")
-    df["soup"] = df.apply(build_soup, axis=1)
-
-    # TF-IDF
-    print("Fitting TF-IDF vectoriser…")
-    tfidf = TfidfVectorizer(stop_words="english")
-    matrix = tfidf.fit_transform(df["soup"])
-
     # Build title → index lookup (lowercase keys for search)
     movie_index = {title.lower(): int(idx) for idx, title in enumerate(df["title"])}
+
+    # Build embedding text and encode
+    print("Building embedding text…")
+    df["embed_text"] = df.apply(build_embed_text, axis=1)
+
+    print("Loading sentence transformer model (all-MiniLM-L6-v2)…")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("Encoding movies (this may take a minute)…")
+    embeddings = model.encode(
+        df["embed_text"].tolist(),
+        show_progress_bar=True,
+        batch_size=64,
+        normalize_embeddings=True,
+    ).astype("float32")
 
     # ------------------------------------------------------------------
     # Poster URLs from Kaggle: sakshisemalti/movies-dataset-with-posters
@@ -116,14 +136,18 @@ def main():
     # Save
     os.makedirs(DATA_DIR, exist_ok=True)
 
+    # Drop embed_text before saving parquet (not needed at runtime)
+    df.drop(columns=["embed_text"], inplace=True)
+
+    os.makedirs(DATA_DIR, exist_ok=True)
     df.to_parquet(f"{DATA_DIR}/movies.parquet", index=False)
-    sparse.save_npz(f"{DATA_DIR}/tfidf_matrix.npz", matrix)
+    np.save(f"{DATA_DIR}/embeddings.npy", embeddings)
     with open(f"{DATA_DIR}/movie_index.json", "w") as f:
         json.dump(movie_index, f)
 
     print(f"Done! Saved {len(df)} movies.")
     print(f"  data/movies.parquet  ({df.memory_usage(deep=True).sum() // 1024} KB in memory)")
-    print(f"  data/tfidf_matrix.npz  shape={matrix.shape}")
+    print(f"  data/embeddings.npy  shape={embeddings.shape}")
     print(f"  data/movie_index.json  ({len(movie_index)} entries)")
 
 

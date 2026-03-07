@@ -9,7 +9,6 @@ import json
 import random
 import numpy as np
 import pandas as pd
-from scipy import sparse
 from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_DIR = "data"
@@ -26,7 +25,7 @@ def load_data():
     global _df, _matrix, _movie_index
     if _df is None:
         _df = pd.read_parquet(f"{DATA_DIR}/movies.parquet")
-        _matrix = sparse.load_npz(f"{DATA_DIR}/tfidf_matrix.npz")
+        _matrix = np.load(f"{DATA_DIR}/embeddings.npy")  # shape (N, 384), float32
         with open(f"{DATA_DIR}/movie_index.json") as f:
             _movie_index = json.load(f)
     return _df, _matrix, _movie_index
@@ -91,12 +90,11 @@ def _get_next_seed(df: pd.DataFrame, seen: set) -> int:
 # ---------------------------------------------------------------------------
 # Taste profile
 # ---------------------------------------------------------------------------
-def _taste_profile(liked: list[int], matrix) -> np.ndarray:
-    """Average TF-IDF vector of liked movies."""
+def _taste_profile(liked: list[int], matrix: np.ndarray) -> np.ndarray:
+    """Average embedding vector of liked movies, returned as shape (1, D)."""
     if not liked:
         return None
-    vectors = matrix[liked]
-    return np.asarray(vectors.mean(axis=0))
+    return matrix[liked].mean(axis=0, keepdims=True)
 
 
 # ---------------------------------------------------------------------------
