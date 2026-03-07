@@ -178,6 +178,49 @@ def rating_sidebar(user: str, df: pd.DataFrame, movie_index: dict):
     unseen   = st.session_state[f"{u}_unseen"]
 
     with st.sidebar:
+        # ── Tonight's Picks ───────────────────────────────────────────────
+        st.markdown("### 🎬 Tonight's Picks")
+        friends = storage.get_friends(u)
+        if friends:
+            selected_friend = st.selectbox(
+                "Who are you watching with tonight?",
+                [f.capitalize() for f in friends],
+                key="watching_with",
+            )
+            if st.button("Get Picks", use_container_width=True, key="get_picks_btn"):
+                st.session_state.compare_user1 = user.capitalize()
+                st.session_state.compare_user2 = selected_friend
+                st.session_state.phase = "results"
+                st.rerun()
+        else:
+            st.caption("Add a friend below to get movie picks together.")
+
+        st.markdown("---")
+
+        # ── Friends ───────────────────────────────────────────────────────
+        st.markdown("### 👥 Friends")
+        if friends:
+            for f in friends:
+                st.markdown(f"• {f.capitalize()}")
+            st.markdown(" ")
+
+        add_input = st.text_input(
+            "Add by username", placeholder="Their username…", key="add_friend_input"
+        )
+        if st.button("Add Friend", use_container_width=True, key="add_friend_btn"):
+            result = storage.add_friend(u, add_input.strip())
+            if result == "ok":
+                st.success(f"Added {add_input.strip().capitalize()}!")
+                st.rerun()
+            elif result == "not_found":
+                st.error("No account with that username.")
+            elif result == "already_friends":
+                st.info("Already friends!")
+            elif result == "self":
+                st.error("You can't add yourself.")
+
+        st.markdown("---")
+
         # ── Search & Add ──────────────────────────────────────────────────
         st.markdown("### 🔍 Search & Add")
 
@@ -308,12 +351,6 @@ def login_phase():
             else:
                 st.success(f"Account created! Switch to the Login tab to sign in.")
 
-    users_with_ratings = storage.list_users()
-    if len(users_with_ratings) >= 2:
-        st.markdown("---")
-        if st.button("🎉 See Results", use_container_width=True):
-            st.session_state.phase = "results"
-            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -362,14 +399,6 @@ def rating_phase():
         _save_from_session(user)
         st.rerun()
 
-    if like_count >= MIN_LIKES:
-        st.markdown(" ")
-        if st.button("✅ I'm Done Rating", use_container_width=True):
-            st.session_state[f"{u}_done"] = True
-            _save_from_session(user)
-            st.session_state.phase = "login"
-            st.rerun()
-
     # Sidebar with search + review
     rating_sidebar(user, df, movie_index)
 
@@ -386,8 +415,8 @@ def results_phase():
     users = storage.list_users()
     if len(users) < 2:
         st.warning("Need at least 2 users who have rated movies.")
-        if st.button("← Back to Login"):
-            st.session_state.phase = "login"
+        if st.button("← Back"):
+            st.session_state.phase = "rating" if st.session_state.active_user else "login"
             st.rerun()
         return
 
@@ -432,8 +461,8 @@ def results_phase():
                 st.markdown("---")
 
     st.markdown(" ")
-    if st.button("← Back to Login", use_container_width=True):
-        st.session_state.phase = "login"
+    if st.button("← Back to Rating", use_container_width=True):
+        st.session_state.phase = "rating"
         st.rerun()
     if st.button("🔄 Reset All Data", use_container_width=True):
         reset_all()

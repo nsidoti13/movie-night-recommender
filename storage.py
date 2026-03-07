@@ -26,9 +26,10 @@ try:
 except ImportError:
     pass
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 RATINGS_FILE  = "data/ratings.json"
 ACCOUNTS_FILE = "data/accounts.json"
+FRIENDS_FILE  = "data/friends.json"
 
 _DEFAULTS = {
     "liked": [],
@@ -77,6 +78,14 @@ def _pg_migrate():
                     password_hash TEXT NOT NULL,
                     salt          TEXT NOT NULL,
                     created_at    TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS friendships (
+                    user_a     TEXT NOT NULL,
+                    user_b     TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (user_a, user_b)
                 )
             """)
             cur.execute("""
@@ -181,6 +190,56 @@ def _accounts_load() -> dict:
 def _accounts_save(data: dict):
     os.makedirs("data", exist_ok=True)
     with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ── Friends storage (PostgreSQL) ───────────────────────────────────────────
+
+def _pg_add_friend(user: str, friend: str):
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO friendships (user_a, user_b) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (user, friend),
+            )
+            cur.execute(
+                "INSERT INTO friendships (user_a, user_b) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (friend, user),
+            )
+
+
+def _pg_get_friends(user: str) -> list[str]:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_b FROM friendships WHERE user_a = %s ORDER BY user_b",
+                (user,),
+            )
+            return [r[0] for r in cur.fetchall()]
+
+
+def _pg_user_exists(username: str) -> bool:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+            return cur.fetchone() is not None
+
+
+# ── Friends storage (JSON file) ─────────────────────────────────────────────
+
+def _friends_load() -> dict:
+    if os.path.exists(FRIENDS_FILE):
+        try:
+            with open(FRIENDS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _friends_save(data: dict):
+    os.makedirs("data", exist_ok=True)
+    with open(FRIENDS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -312,6 +371,57 @@ def _file_clear():
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
+
+def user_exists(username: str) -> bool:
+    _ensure_migrated()
+    u = username.lower()
+    if _use_postgres():
+        try:
+            return _pg_user_exists(u)
+        except Exception as exc:
+            print(f"[storage] user_exists() DB error ({exc}); using file fallback.")
+    return u in _accounts_load()
+
+
+def add_friend(user: str, friend: str) -> str:
+    """Add a mutual friendship. Returns 'ok', 'not_found', 'already_friends', or 'self'."""
+    u = user.lower()
+    f = friend.lower()
+    if u == f:
+        return "self"
+    if not user_exists(f):
+        return "not_found"
+    if f in get_friends(u):
+        return "already_friends"
+    _ensure_migrated()
+    if _use_postgres():
+        try:
+            _pg_add_friend(u, f)
+            return "ok"
+        except Exception as exc:
+            print(f"[storage] add_friend() DB error ({exc}); using file fallback.")
+    data = _friends_load()
+    data.setdefault(u, [])
+    data.setdefault(f, [])
+    if f not in data[u]:
+        data[u].append(f)
+    if u not in data[f]:
+        data[f].append(u)
+    _friends_save(data)
+    return "ok"
+
+
+def get_friends(user: str) -> list[str]:
+    """Return sorted list of friend usernames for the given user."""
+    _ensure_migrated()
+    u = user.lower()
+    if _use_postgres():
+        try:
+            return _pg_get_friends(u)
+        except Exception as exc:
+            print(f"[storage] get_friends() DB error ({exc}); using file fallback.")
+    return sorted(_friends_load().get(u, []))
+
 
 def create_user(username: str, password: str) -> bool:
     """Register a new account. Returns False if username already taken."""

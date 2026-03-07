@@ -8,6 +8,14 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Friend connections (stored bidirectionally)
+CREATE TABLE IF NOT EXISTS friendships (
+    user_a     TEXT NOT NULL,
+    user_b     TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_a, user_b)
+);
+
 -- Stores each movie rating per user
 CREATE TABLE IF NOT EXISTS ratings (
     user_name   TEXT    NOT NULL,
