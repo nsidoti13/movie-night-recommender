@@ -21,6 +21,85 @@ PLACEHOLDER_IMG = "https://via.placeholder.com/300x450?text=No+Poster"
 
 st.set_page_config(page_title="Movie Night 🎬", layout="centered")
 
+
+def inject_css():
+    st.markdown("""
+    <style>
+    /* ── Genre + rating pill badges ─────────────────────────────────── */
+    .genre-pill {
+        display: inline-block;
+        background: rgba(229, 9, 20, 0.12);
+        color: #ff6b6b;
+        border: 1px solid rgba(229, 9, 20, 0.25);
+        border-radius: 20px;
+        padding: 2px 10px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        margin: 2px 2px 2px 0;
+        letter-spacing: 0.02em;
+    }
+    .vote-badge {
+        display: inline-block;
+        background: rgba(255, 200, 0, 0.12);
+        color: #ffc800;
+        border: 1px solid rgba(255, 200, 0, 0.25);
+        border-radius: 20px;
+        padding: 2px 10px;
+        font-size: 0.72rem;
+        font-weight: 600;
+        margin: 2px 4px 2px 0;
+    }
+
+    /* ── Movie poster image ──────────────────────────────────────────── */
+    [data-testid="stImage"] img {
+        border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        width: 100%;
+    }
+
+    /* ── Action buttons ──────────────────────────────────────────────── */
+    .stButton > button {
+        border-radius: 10px;
+        font-size: 1rem;
+        font-weight: 600;
+        padding: 0.55rem 1rem;
+        transition: transform 0.12s ease, box-shadow 0.12s ease;
+        border: 1px solid rgba(255,255,255,0.08);
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+    }
+    .stButton > button:active {
+        transform: translateY(0);
+    }
+
+    /* ── Progress bar ────────────────────────────────────────────────── */
+    .stProgress > div > div > div > div {
+        background: linear-gradient(90deg, #E50914, #ff4444);
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────── */
+    [data-testid="stSidebar"] {
+        border-right: 1px solid rgba(255,255,255,0.06);
+    }
+
+    /* ── Page headings ───────────────────────────────────────────────── */
+    h1 { font-weight: 800; letter-spacing: -0.5px; }
+    h3 { font-weight: 700; margin-bottom: 0.25rem; }
+
+    /* ── Tabs ────────────────────────────────────────────────────────── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        font-weight: 600;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -52,17 +131,45 @@ def get_poster(row: dict) -> str:
     return PLACEHOLDER_IMG
 
 
-def render_card(row, row_idx: int):
-    title = row.get("title", "Unknown")
-    year = int(row.get("year", 0)) if row.get("year") else "?"
-    genres = genre_tags(row.get("genres", "[]"))
-    overview = str(row.get("overview", ""))
-    overview_short = overview[:250] + ("…" if len(overview) > 250 else "")
+def _badge_html(row: dict) -> str:
+    """Build HTML string of vote badge + genre pills for a movie row."""
+    parts = []
+    vote = row.get("vote_average")
+    if vote and float(vote) > 0:
+        parts.append(f'<span class="vote-badge">⭐ {float(vote):.1f}</span>')
+    for g in parse_list_field(row.get("genres", "[]"))[:4]:
+        parts.append(f'<span class="genre-pill">{g}</span>')
+    return " ".join(parts)
 
-    st.image(get_poster(row), width=240)
-    st.markdown(f"## {title} ({year})")
-    st.caption(genres)
-    st.write(overview_short)
+
+def render_card(row, row_idx: int):
+    """Full movie card: poster left, info right."""
+    title    = row.get("title", "Unknown")
+    year     = int(row.get("year", 0)) if row.get("year") else "?"
+    overview = str(row.get("overview", ""))
+    overview_short = overview[:300] + ("…" if len(overview) > 300 else "")
+
+    col_poster, col_info = st.columns([1, 2])
+    with col_poster:
+        st.image(get_poster(row), use_container_width=True)
+    with col_info:
+        st.markdown(f"### {title} ({year})")
+        badges = _badge_html(row)
+        if badges:
+            st.markdown(badges, unsafe_allow_html=True)
+            st.markdown(" ")
+        st.write(overview_short)
+
+
+def render_mini_card(row, idx: int):
+    """Compact card for the results grid: poster + title + badges."""
+    title = row.get("title", "Unknown")
+    year  = int(row.get("year", 0)) if row.get("year") else "?"
+    st.image(get_poster(row), use_container_width=True)
+    st.markdown(f"**{title}** ({year})")
+    badges = _badge_html(row)
+    if badges:
+        st.markdown(badges, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +427,13 @@ def _enter_as(uname: str):
 
 
 def login_phase():
-    st.title("🎬 Movie Night")
+    st.markdown("""
+    <div style="text-align:center; padding:2.5rem 0 1.5rem">
+        <div style="font-size:3.5rem; line-height:1">🎬</div>
+        <h1 style="font-size:2.6rem; font-weight:900; margin:0.4rem 0 0.2rem">Movie Night</h1>
+        <p style="color:#888; font-size:1rem; margin:0">Discover movies you'll both love</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
 
@@ -366,34 +479,37 @@ def rating_phase():
     disliked = st.session_state[f"{u}_disliked"]
     card_key = f"current_card_{u}"
 
-    st.title(f"🎬 {user.capitalize()}'s Turn")
+    st.markdown(f"## 🎬 {user.capitalize()}'s Queue")
     like_count = len(liked)
-    st.progress(
-        min(like_count / MIN_LIKES, 1.0),
-        text=f"{like_count}/{MIN_LIKES} likes"
-        if like_count < MIN_LIKES else f"{like_count} likes ✅"
+    progress_val = min(like_count / MIN_LIKES, 1.0)
+    progress_text = (
+        f"{like_count} / {MIN_LIKES} likes to unlock picks"
+        if like_count < MIN_LIKES
+        else f"✅  {like_count} likes — you can get picks anytime!"
     )
+    st.progress(progress_val, text=progress_text)
 
     card_idx = st.session_state[card_key]
     row = df.iloc[card_idx].to_dict()
     render_card(row, card_idx)
     st.markdown("---")
 
+    st.markdown(" ")
     b1, b2, b3 = st.columns(3)
 
-    if b1.button("👍 Like", use_container_width=True, key="btn_like"):
+    if b1.button("👍  Love it", use_container_width=True, key="btn_like", type="primary"):
         liked.append(card_idx)
         _advance_card(user)
         _save_from_session(user)
         st.rerun()
 
-    if b2.button("👎 Dislike", use_container_width=True, key="btn_dislike"):
+    if b2.button("👎  Not for me", use_container_width=True, key="btn_dislike"):
         disliked.append(card_idx)
         _advance_card(user)
         _save_from_session(user)
         st.rerun()
 
-    if b3.button("🤷 Haven't Seen", use_container_width=True, key="btn_unseen"):
+    if b3.button("🤷  Haven't Seen", use_container_width=True, key="btn_unseen"):
         st.session_state[f"{u}_unseen"].append(card_idx)
         _advance_card(user)
         _save_from_session(user)
@@ -410,7 +526,12 @@ def rating_phase():
 def results_phase():
     df, _, _ = load_data()
 
-    st.title("🎉 Movies You'll Both Love")
+    st.markdown("""
+    <div style="text-align:center; padding:1rem 0 0.5rem">
+        <h1 style="font-size:2.2rem; font-weight:900; margin:0">🎉 Tonight's Picks</h1>
+        <p style="color:#888; margin:0.3rem 0 0">Movies you'll both love</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     users = storage.list_users()
     if len(users) < 2:
@@ -453,12 +574,13 @@ def results_phase():
     if not recs:
         st.warning("Not enough data. Go back and rate more movies!")
     else:
-        cols = st.columns(2)
+        st.markdown(" ")
+        cols = st.columns(3)
         for i, idx in enumerate(recs):
             row = df.iloc[idx].to_dict()
-            with cols[i % 2]:
-                render_card(row, idx)
-                st.markdown("---")
+            with cols[i % 3]:
+                render_mini_card(row, idx)
+                st.markdown(" ")
 
     st.markdown(" ")
     if st.button("← Back to Rating", use_container_width=True):
@@ -473,6 +595,7 @@ def results_phase():
 # Main
 # ---------------------------------------------------------------------------
 
+inject_css()
 init_state()
 
 if st.session_state.phase == "login":
